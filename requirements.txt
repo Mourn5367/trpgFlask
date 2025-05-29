@@ -1,0 +1,12 @@
+
+# Flask 웹 프레임워크
+Flask==3.0.0
+
+# WebSocket 지원
+flask-sock==0.7.0
+
+# HTTP 요청 라이브러리 (Ollama, Stable Diffusion API 호출용)
+requests==2.31.0
+
+# Production WSGI 서버 (배포용)
+gunicorn==21.2.0
