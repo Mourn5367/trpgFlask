@@ -3,9 +3,6 @@ from flask_sock import Sock
 import json
 import requests
 import traceback
-import base64
-from PIL import Image
-import io
 
 app = Flask(__name__)
 sock = Sock(app)
