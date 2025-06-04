@@ -7,3 +7,5 @@ flask-sock==0.7.0
 
 # HTTP 요청 라이브러리 (Ollama, Stable Diffusion API 호출용)
 requests==2.32.3
+
+Pillow==10.4.0
