@@ -3,13 +3,17 @@ from flask_sock import Sock
 import json
 import requests
 import traceback
+import base64
+from PIL import Image
+import io
 
 app = Flask(__name__)
 sock = Sock(app)
 
 # API 엔드포인트 설정
 OLLAMA_API_URL = "http://192.168.24.189:11434/api/generate"
-SD_API_URL = "http://127.0.0.1:7860/sdapi/v1"
+SD_API_URL = "http://192.168.24.189:7860/sdapi/v1"
+TTS_API_URL = "http://192.168.24.189:9880/tts"
 
 # 기본 설정
 DEFAULT_MODEL = "gemma3:4b"
@@ -23,6 +27,7 @@ def index():
     <ul>
         <li>채팅: Ollama API 연동</li>
         <li>이미지 생성: Stable Diffusion API 연동</li>
+        <li>음성 생성: TTS API 연동</li>
         <li>WebSocket 엔드포인트: /ws</li>
     </ul>
     """
@@ -52,6 +57,10 @@ def websocket(ws):
                 elif msg_type == "generate_image":
                     handle_image_generation(ws, json_data)
 
+                # 음성 생성 관련 처리 (TTS)
+                elif msg_type == "generate_tts":
+                    handle_tts_generation(ws, json_data)
+
                 # 모델 목록 조회 (Stable Diffusion)
                 elif msg_type == "get_models":
                     handle_get_models(ws, json_data)
@@ -68,7 +77,8 @@ def websocket(ws):
                         "message": "서버가 정상 동작 중입니다.",
                         "services": {
                             "ollama": check_ollama_connection(),
-                            "stable_diffusion": check_sd_connection()
+                            "stable_diffusion": check_sd_connection(),
+                            "tts": check_tts_connection()
                         }
                     }))
 
@@ -85,7 +95,8 @@ def websocket(ws):
                         "message": f"지원하지 않는 메시지 타입: {msg_type}",
                         "supported_types": [
                             "chat", "message", "greeting",
-                            "generate_image", "get_models", "change_model", "ping"
+                            "generate_image", "generate_tts", 
+                            "get_models", "change_model", "ping"
                         ],
                         "original": json_data
                     }))
@@ -135,17 +146,17 @@ def handle_chat_message(ws, json_data):
 def handle_image_generation(ws, json_data):
     """이미지 생성 처리 (Stable Diffusion API)"""
     prompt = json_data.get("prompt", "")
-    
+
     if not prompt:
         ws.send(json.dumps({
-            "status": "error", 
+            "status": "error",
             "message": "프롬프트가 필요합니다."
         }))
         return
 
     # 진행 상태 메시지 전송
     ws.send(json.dumps({
-        "status": "processing", 
+        "status": "processing",
         "message": "이미지 생성 중...",
         "type": "image_generation_progress"
     }))
@@ -165,9 +176,51 @@ def handle_image_generation(ws, json_data):
     except Exception as e:
         print(f"이미지 생성 오류: {e}")
         ws.send(json.dumps({
-            "status": "error", 
+            "status": "error",
             "message": str(e),
             "type": "image_generation_error",
+            "original": json_data
+        }))
+
+
+def handle_tts_generation(ws, json_data):
+    """TTS 음성 생성 처리"""
+    text = json_data.get("text", "")
+
+    if not text.strip():
+        ws.send(json.dumps({
+            "status": "error",
+            "message": "변환할 텍스트가 필요합니다.",
+            "type": "tts_error",
+            "original": json_data
+        }))
+        return
+
+    # 진행 상태 메시지 전송
+    ws.send(json.dumps({
+        "status": "processing",
+        "message": "음성 생성 중...",
+        "type": "tts_generation_progress"
+    }))
+
+    try:
+        params = json_data.get("params", {})
+        audio_data = generate_tts(text, params)
+
+        ws.send(json.dumps({
+            "status": "success",
+            "type": "tts_generated",
+            "audio": audio_data,
+            "text": text,
+            "original": json_data
+        }))
+
+    except Exception as e:
+        print(f"TTS 생성 오류: {e}")
+        ws.send(json.dumps({
+            "status": "error",
+            "message": str(e),
+            "type": "tts_generation_error",
             "original": json_data
         }))
 
@@ -177,14 +230,14 @@ def handle_get_models(ws, json_data):
     try:
         models = get_sd_models()
         ws.send(json.dumps({
-            "status": "success", 
+            "status": "success",
             "type": "models_list",
             "models": models,
             "original": json_data
         }))
     except Exception as e:
         ws.send(json.dumps({
-            "status": "error", 
+            "status": "error",
             "message": str(e),
             "type": "models_error",
             "original": json_data
@@ -194,10 +247,10 @@ def handle_get_models(ws, json_data):
 def handle_change_model(ws, json_data):
     """모델 변경 처리"""
     model_name = json_data.get("model_name")
-    
+
     if not model_name:
         ws.send(json.dumps({
-            "status": "error", 
+            "status": "error",
             "message": "모델 이름이 필요합니다.",
             "original": json_data
         }))
@@ -214,7 +267,7 @@ def handle_change_model(ws, json_data):
         }))
     except Exception as e:
         ws.send(json.dumps({
-            "status": "error", 
+            "status": "error",
             "message": str(e),
             "type": "model_change_error",
             "original": json_data
@@ -328,6 +381,33 @@ def generate_image(prompt, params=None):
         raise Exception("이미지 생성 실패: 이미지가 반환되지 않았습니다.")
 
 
+def generate_tts(text, params=None):
+    """TTS 음성 생성"""
+    if params is None:
+        params = {}
+
+    # 기본값 설정
+    payload = {
+        "text": text,
+        "text_lang": params.get("text_lang", "ko"),
+        "ref_audio_path": params.get("ref_audio_path", "A-A3-E-055-0101.wav"),
+        "prompt_lang": params.get("prompt_lang", "ko"),
+        "prompt_text": params.get("prompt_text", "지금이 범인을 찾을 땐가요, 아버지라면 당연히 생사를 오가는 딸 곁에 있어 주셔야죠!"),
+        "media_type": params.get("media_type", "wav")
+    }
+
+    print(f"TTS API 요청: {payload}")
+
+    response = requests.post(TTS_API_URL, json=payload)
+
+    if response.status_code != 200:
+        raise Exception(f"TTS API 오류: {response.status_code} - {response.text}")
+
+    # 오디오 데이터를 base64로 인코딩하여 반환
+    audio_base64 = base64.b64encode(response.content).decode('utf-8')
+    return audio_base64
+
+
 def get_sd_models():
     """Stable Diffusion 모델 목록 가져오기"""
     response = requests.get(f"{SD_API_URL}/sd-models")
@@ -350,9 +430,9 @@ def check_ollama_connection():
     """Ollama 서버 연결 확인"""
     try:
         # 간단한 테스트 요청
-        response = requests.post(OLLAMA_API_URL, 
-                               json={"model": DEFAULT_MODEL, "prompt": "test", "stream": False}, 
-                               timeout=5)
+        response = requests.post(OLLAMA_API_URL,
+                                 json={"model": DEFAULT_MODEL, "prompt": "test", "stream": False},
+                                 timeout=5)
         return response.status_code == 200
     except:
         return False
@@ -367,21 +447,40 @@ def check_sd_connection():
         return False
 
 
+def check_tts_connection():
+    """TTS 서버 연결 확인"""
+    try:
+        # 간단한 테스트 요청 (빈 텍스트로는 오류가 날 수 있으므로 최소한의 텍스트 사용)
+        test_payload = {
+            "text": "테스트",
+            "text_lang": "ko",
+            "ref_audio_path": "A-A3-E-055-0101.wav",
+            "prompt_lang": "ko",
+            "prompt_text": "테스트",
+            "media_type": "wav"
+        }
+        response = requests.post(TTS_API_URL, json=test_payload, timeout=10)
+        return response.status_code == 200
+    except:
+        return False
+
+
 if __name__ == '__main__':
     print("=== 통합 AI 서버 시작 ===")
     print(f"Ollama API URL: {OLLAMA_API_URL}")
     print(f"Stable Diffusion API URL: {SD_API_URL}")
+    print(f"TTS API URL: {TTS_API_URL}")
     print("서버 포트: 8000")
-    
+
     # 연결 테스트
     print("\n=== 연결 테스트 ===")
-    
+
     # Ollama 연결 테스트
     if check_ollama_connection():
         print("✅ Ollama API 연결 성공!")
     else:
         print("⚠️ Ollama API 연결 실패 - 서버가 실행 중인지 확인하세요")
-    
+
     # Stable Diffusion 연결 테스트
     if check_sd_connection():
         try:
@@ -392,6 +491,12 @@ if __name__ == '__main__':
             print(f"⚠️ Stable Diffusion 모델 목록 조회 실패: {e}")
     else:
         print("⚠️ Stable Diffusion API 연결 실패 - AUTOMATIC1111 웹 UI가 --api 옵션으로 실행 중인지 확인하세요")
-    
+
+    # TTS 연결 테스트
+    if check_tts_connection():
+        print("✅ TTS API 연결 성공!")
+    else:
+        print("⚠️ TTS API 연결 실패 - TTS 서버가 localhost:9880에서 실행 중인지 확인하세요")
+
     print("\n=== 서버 실행 ===")
     app.run(host='0.0.0.0', port=8000, debug=True)
