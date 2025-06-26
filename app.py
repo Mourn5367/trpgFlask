@@ -19,9 +19,52 @@ TTS_API_URL = "http://192.168.24.189:9880/tts"
 
 # 기본 설정
 DEFAULT_MODEL = "gemma3:4b"
-
 # 메모리 기반 대화 세션 저장소
 chat_sessions = {}
+# 시스템 프롬프트 설정
+SYSTEM_PROMPTS = {
+    "default": """# TRPG MASTER의 역할
+
+    당신은 TRPG 스토리를 생성하는 작가이자, TRPG 게임을 진행하는 GAME MASTER 입니다.
+    
+    ## 글쓰기 스타일
+    - **감정 표현**: 풍부한 감정과 분위기를 담아주세요
+    - **생동감**: 독자가 몰입할 수 있는 생생한 묘사를 하세요
+    - **창의성**: 독창적이고 참신한 아이디어를 제시하세요
+    
+    ## 답변 방식
+    - 플레이어에게는 체력에 해당하는 HP와 랜덤한 능력치, 특별한 기질을 가지고 있습니다
+    - 플레이어의 상황과 능력에 맞게 스토리를 진행합니다
+    - 세계관은 현실, 가상 모두 가능합니다
+    - 플레이어의 응답에 따라 이야기를 생성하시오
+    - 이해가 가지 않는 부분과 없는 지식일 경우 플레이어에게 확답을 받으시오
+    - 마지막에는 플레이어의 선택지를 약 3개정도 주도록 하시오. 선택지가 적거나 없는 경우 억지로 3개를 맞출필요는 없습니다.
+    - 확률이 들어가는 선택지인 경우 플레이어에게 1 부터 10 까지 나오는 주사위를 던지게 하시오
+    - 특별한 기질을 가지고 있는 경우 플레이어에게 유리한 주사위 숫자가 나오도록합니다.
+    
+    ## 답변 구조
+    0. 플레이어에게 선택지를 제공하여 적합한 응답을 한 경우 응답에 맞는 이벤트 발생
+    1. 플레이어가 잘못된 응답을 한 경우 답변을 중지하고 다시 받도록합니다.
+    2. 진행중인 이벤트 설명
+    3. 플레이어에게 닥친 상황 설명
+    4. 플레이어에게 선택지 제공
+    
+    """,
+}
+
+
+def get_system_prompt(original_request):
+    """요청에 따른 시스템 프롬프트 반환"""
+    # 요청에서 프롬프트 타입 확인
+    prompt_type = original_request.get("prompt_type", "default")
+
+    # 커스텀 시스템 프롬프트가 있으면 우선 사용
+    custom_prompt = original_request.get("system_prompt")
+    if custom_prompt:
+        return custom_prompt
+
+    # 사전 정의된 프롬프트 사용
+    return SYSTEM_PROMPTS.get(prompt_type, SYSTEM_PROMPTS["default"])
 
 
 class ChatSession:
@@ -92,7 +135,7 @@ def index():
 
 @app.route('/conversations')
 def list_conversations():
-    """활성 대화 목록 반환"""
+    """활성 대화 목록 반환 (디버깅용)"""
     conversations = []
     for session_id, session in chat_sessions.items():
         conversations.append({
@@ -106,7 +149,7 @@ def list_conversations():
 
 @app.route('/conversation/<conversation_id>')
 def get_conversation(conversation_id):
-    """특정 대화 내용 반환"""
+    """특정 대화 내용 반환 (디버깅용)"""
     if conversation_id in chat_sessions:
         return json.dumps(chat_sessions[conversation_id].get_conversation_info(), ensure_ascii=False, indent=2)
     else:
@@ -367,67 +410,51 @@ def handle_change_model(ws, json_data):
 
 
 def handle_list_conversations(ws, json_data):
-    """대화 목록 반환"""
-    conversations = []
-    for session_id, session in chat_sessions.items():
-        conversations.append({
-            "conversation_id": session_id,
-            "message_count": len(session.messages),
-            "created_at": session.created_at.isoformat(),
-            "preview": session.messages[-1]["content"][:100] if session.messages else "새 대화"
-        })
-
+    """대화 목록 반환 (사용 안 함 - Spring Boot에서 관리)"""
     ws.send(json.dumps({
-        "status": "success",
-        "type": "conversations_list",
-        "conversations": conversations,
-        "total": len(conversations)
+        "status": "error",
+        "message": "이 기능은 Spring Boot에서 관리합니다.",
+        "note": "Flask는 순수 AI 처리만 담당합니다."
     }))
 
 
 def handle_load_conversation(ws, json_data):
-    """특정 대화 불러오기"""
-    conversation_id = json_data.get("conversation_id")
-
-    if not conversation_id:
-        ws.send(json.dumps({
-            "status": "error",
-            "message": "conversation_id가 필요합니다."
-        }))
-        return
-
-    if conversation_id in chat_sessions:
-        session = chat_sessions[conversation_id]
-        ws.send(json.dumps({
-            "status": "success",
-            "type": "conversation_loaded",
-            "conversation": session.get_conversation_info()
-        }))
-    else:
-        ws.send(json.dumps({
-            "status": "error",
-            "message": "대화를 찾을 수 없습니다."
-        }))
+    """특정 대화 불러오기 (사용 안 함 - Spring Boot에서 관리)"""
+    ws.send(json.dumps({
+        "status": "error",
+        "message": "이 기능은 Spring Boot에서 관리합니다.",
+        "note": "세션 ID로 바로 채팅하세요."
+    }))
 
 
 def handle_new_conversation(ws, json_data):
-    """새 대화 시작"""
-    session = get_or_create_session()
+    """새 대화 시작 (사용 안 함 - Spring Boot에서 관리)"""
     ws.send(json.dumps({
-        "status": "success",
-        "type": "new_conversation_created",
-        "conversation_id": session.conversation_id,
-        "created_at": session.created_at.isoformat()
+        "status": "error",
+        "message": "이 기능은 Spring Boot에서 관리합니다.",
+        "note": "새 세션 ID로 바로 채팅하세요."
     }))
 
 
 def stream_ollama_chat(session, model, ws, original_request):
     """Ollama /api/chat 엔드포인트를 사용하여 스트리밍 (대화 기록 포함)"""
 
-    # messages 배열 형태로 요청 구성
+    # 시스템 프롬프트 설정
+    system_prompt = get_system_prompt(original_request)
+
+    # messages 배열 구성 (시스템 프롬프트 포함)
+    messages = []
+
+    # 시스템 프롬프트가 있으면 첫 번째에 추가
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+
+    # 기존 대화 기록 추가
+    messages.extend(session.get_messages_for_ollama())
+
     payload = {
         "model": model,
-        "messages": session.get_messages_for_ollama(),
+        "messages": messages,
         "stream": True
     }
 
