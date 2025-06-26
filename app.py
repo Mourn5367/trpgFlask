@@ -3,7 +3,9 @@ from flask_sock import Sock
 import json
 import requests
 import traceback
+import uuid
 import base64
+from datetime import datetime
 from PIL import Image
 import io
 
@@ -11,26 +13,104 @@ app = Flask(__name__)
 sock = Sock(app)
 
 # API 엔드포인트 설정
-OLLAMA_API_URL = "http://192.168.24.189:11434/api/generate"
+OLLAMA_API_URL = "http://192.168.24.189:11434/api/chat"  # /api/chat 사용
 SD_API_URL = "http://192.168.24.189:7860/sdapi/v1"
 TTS_API_URL = "http://192.168.24.189:9880/tts"
 
 # 기본 설정
 DEFAULT_MODEL = "gemma3:4b"
 
+# 메모리 기반 대화 세션 저장소
+chat_sessions = {}
+
+
+class ChatSession:
+    def __init__(self, conversation_id=None):
+        # Spring Boot에서 전달받은 세션 ID 사용
+        self.conversation_id = conversation_id or str(uuid.uuid4())
+        self.messages = []
+        self.created_at = datetime.now()
+
+    def add_message(self, role, content):
+        """메시지 추가 (role: 'user' 또는 'assistant')"""
+        message = {
+            "role": role,
+            "content": content,
+            "order": len(self.messages),
+            "timestamp": datetime.now().isoformat()
+        }
+        self.messages.append(message)
+        return message
+
+    def get_messages_for_ollama(self):
+        """Ollama API용 메시지 형식으로 변환"""
+        return [{"role": msg["role"], "content": msg["content"]} for msg in self.messages]
+
+    def get_conversation_info(self):
+        """대화 정보 반환"""
+        return {
+            "conversation_id": self.conversation_id,
+            "message_count": len(self.messages),
+            "created_at": self.created_at.isoformat(),
+            "messages": self.messages
+        }
+
+
+def get_or_create_session(conversation_id=None):
+    """세션 가져오기 또는 새로 생성 (Spring Boot 세션 ID 기반)"""
+    if conversation_id and conversation_id in chat_sessions:
+        print(f"기존 세션 사용: {conversation_id}")
+        return chat_sessions[conversation_id]
+
+    # 새 세션 생성 (Spring Boot에서 전달받은 ID 사용)
+    session = ChatSession(conversation_id)
+    chat_sessions[session.conversation_id] = session
+    print(f"새 세션 생성: {session.conversation_id}")
+    return session
+
 
 @app.route('/')
 def index():
-    return """
-    <h1>통합 AI 서버</h1>
+    return f"""
+    <h1>통합 AI 서버 (대화 기록 관리)</h1>
     <p>WebSocket 서버가 실행 중입니다.</p>
     <ul>
-        <li>채팅: Ollama API 연동</li>
+        <li>채팅: Ollama /api/chat 엔드포인트 (대화 기록 관리)</li>
         <li>이미지 생성: Stable Diffusion API 연동</li>
         <li>음성 생성: TTS API 연동</li>
         <li>WebSocket 엔드포인트: /ws</li>
     </ul>
+    <h3>현재 활성 대화 수: {len(chat_sessions)}</h3>
+    <h3>서비스 상태:</h3>
+    <ul>
+        <li>Ollama: {'✅' if check_ollama_connection() else '❌'}</li>
+        <li>Stable Diffusion: {'✅' if check_sd_connection() else '❌'}</li>
+        <li>TTS: {'✅' if check_tts_connection() else '❌'}</li>
+    </ul>
     """
+
+
+@app.route('/conversations')
+def list_conversations():
+    """활성 대화 목록 반환"""
+    conversations = []
+    for session_id, session in chat_sessions.items():
+        conversations.append({
+            "conversation_id": session_id,
+            "message_count": len(session.messages),
+            "created_at": session.created_at.isoformat(),
+            "last_message": session.messages[-1]["content"][:50] + "..." if session.messages else "대화 없음"
+        })
+    return json.dumps(conversations, ensure_ascii=False, indent=2)
+
+
+@app.route('/conversation/<conversation_id>')
+def get_conversation(conversation_id):
+    """특정 대화 내용 반환"""
+    if conversation_id in chat_sessions:
+        return json.dumps(chat_sessions[conversation_id].get_conversation_info(), ensure_ascii=False, indent=2)
+    else:
+        return json.dumps({"error": "대화를 찾을 수 없습니다."}, ensure_ascii=False), 404
 
 
 @sock.route('/ws')
@@ -49,8 +129,8 @@ def websocket(ws):
                 msg_type = json_data.get("type", "")
                 print(f"메시지 타입: {msg_type}")
 
-                # 채팅 관련 처리 (Ollama)
-                if msg_type in ["chat", "message", "greeting"] or "message" in json_data:
+                # 채팅 관련 처리 (Ollama) - 대화 기록 관리 포함
+                if msg_type == "chat":
                     handle_chat_message(ws, json_data)
 
                 # 이미지 생성 관련 처리 (Stable Diffusion)
@@ -75,27 +155,27 @@ def websocket(ws):
                         "status": "ok",
                         "type": "pong",
                         "message": "서버가 정상 동작 중입니다.",
+                        "active_conversations": len(chat_sessions),
                         "services": {
                             "ollama": check_ollama_connection(),
                             "stable_diffusion": check_sd_connection(),
                             "tts": check_tts_connection()
-                        }
+                        },
+                        "original": json_data
                     }))
 
                 # 이전 버전 호환성 (prompt만 있는 경우)
                 elif "prompt" in json_data and not msg_type:
-                    # 프롬프트만 있으면 이미지 생성으로 처리
                     json_data["type"] = "generate_image"
                     handle_image_generation(ws, json_data)
 
                 else:
-                    # 알 수 없는 메시지 타입
                     ws.send(json.dumps({
                         "status": "error",
                         "message": f"지원하지 않는 메시지 타입: {msg_type}",
                         "supported_types": [
-                            "chat", "message", "greeting",
-                            "generate_image", "generate_tts", 
+                            "chat",  # Ollama 채팅 전용
+                            "generate_image", "generate_tts",
                             "get_models", "change_model", "ping"
                         ],
                         "original": json_data
@@ -123,9 +203,10 @@ def websocket(ws):
 
 
 def handle_chat_message(ws, json_data):
-    """채팅 메시지 처리 (Ollama API)"""
+    """채팅 메시지 처리 (대화 기록 관리 포함)"""
     message = json_data.get("message", "")
     model = json_data.get("model", DEFAULT_MODEL)
+    conversation_id = json_data.get("conversation_id")
 
     print(f"채팅 처리: '{message}', 모델: {model}")
 
@@ -137,9 +218,19 @@ def handle_chat_message(ws, json_data):
         }))
         return
 
-    # Ollama 스트리밍 호출
+    # 세션 가져오기 또는 생성
+    session = get_or_create_session(conversation_id)
+
+    # 사용자 메시지 추가
+    user_msg = session.add_message("user", message)
+
+    print(f"대화 ID: {session.conversation_id}")
+    print(f"메시지 순서: {user_msg['order']}")
+    print(f"현재 메시지 수: {len(session.messages)}")
+
+    # Ollama 스트리밍 호출 (대화 기록 포함)
     print("Ollama API 스트리밍 호출 시작...")
-    stream_ollama_to_websocket(message, model, ws, json_data)
+    stream_ollama_chat(session, model, ws, json_data)
     print("Ollama API 스트리밍 호출 완료")
 
 
@@ -150,7 +241,8 @@ def handle_image_generation(ws, json_data):
     if not prompt:
         ws.send(json.dumps({
             "status": "error",
-            "message": "프롬프트가 필요합니다."
+            "message": "프롬프트가 필요합니다.",
+            "original": json_data
         }))
         return
 
@@ -274,15 +366,72 @@ def handle_change_model(ws, json_data):
         }))
 
 
-def stream_ollama_to_websocket(message, model, ws, original_request):
-    """Ollama API를 스트리밍 모드로 호출하고 웹소켓으로 전송"""
+def handle_list_conversations(ws, json_data):
+    """대화 목록 반환"""
+    conversations = []
+    for session_id, session in chat_sessions.items():
+        conversations.append({
+            "conversation_id": session_id,
+            "message_count": len(session.messages),
+            "created_at": session.created_at.isoformat(),
+            "preview": session.messages[-1]["content"][:100] if session.messages else "새 대화"
+        })
+
+    ws.send(json.dumps({
+        "status": "success",
+        "type": "conversations_list",
+        "conversations": conversations,
+        "total": len(conversations)
+    }))
+
+
+def handle_load_conversation(ws, json_data):
+    """특정 대화 불러오기"""
+    conversation_id = json_data.get("conversation_id")
+
+    if not conversation_id:
+        ws.send(json.dumps({
+            "status": "error",
+            "message": "conversation_id가 필요합니다."
+        }))
+        return
+
+    if conversation_id in chat_sessions:
+        session = chat_sessions[conversation_id]
+        ws.send(json.dumps({
+            "status": "success",
+            "type": "conversation_loaded",
+            "conversation": session.get_conversation_info()
+        }))
+    else:
+        ws.send(json.dumps({
+            "status": "error",
+            "message": "대화를 찾을 수 없습니다."
+        }))
+
+
+def handle_new_conversation(ws, json_data):
+    """새 대화 시작"""
+    session = get_or_create_session()
+    ws.send(json.dumps({
+        "status": "success",
+        "type": "new_conversation_created",
+        "conversation_id": session.conversation_id,
+        "created_at": session.created_at.isoformat()
+    }))
+
+
+def stream_ollama_chat(session, model, ws, original_request):
+    """Ollama /api/chat 엔드포인트를 사용하여 스트리밍 (대화 기록 포함)"""
+
+    # messages 배열 형태로 요청 구성
     payload = {
         "model": model,
-        "prompt": message,
+        "messages": session.get_messages_for_ollama(),
         "stream": True
     }
 
-    print(f"Ollama API 요청: {payload}")
+    print(f"Ollama /api/chat 요청: {payload}")
 
     try:
         response = requests.post(OLLAMA_API_URL, json=payload, stream=True)
@@ -301,34 +450,43 @@ def stream_ollama_to_websocket(message, model, ws, original_request):
                 try:
                     chunk_data = json.loads(line.decode('utf-8'))
 
-                    if 'response' in chunk_data:
-                        chunk_text = chunk_data['response']
+                    if 'message' in chunk_data and 'content' in chunk_data['message']:
+                        chunk_text = chunk_data['message']['content']
                         full_response += chunk_text
 
                         ws.send(json.dumps({
                             "status": "streaming",
                             "type": "chat_chunk",
-                            "original": original_request,
+                            "conversation_id": session.conversation_id,
                             "chunk": chunk_text,
                             "response_so_far": full_response,
                             "done": False,
-                            "chunk_number": chunk_count
+                            "chunk_number": chunk_count,
+                            "message_order": len(session.messages),
+                            "original": original_request
                         }))
 
                     if chunk_data.get('done', False):
                         print("스트리밍 완료됨")
+
+                        # 어시스턴트 응답을 세션에 추가
+                        assistant_msg = session.add_message("assistant", full_response)
+
                         ws.send(json.dumps({
                             "status": "complete",
                             "type": "chat_complete",
-                            "original": original_request,
+                            "conversation_id": session.conversation_id,
                             "response": full_response,
                             "done": True,
                             "model": model,
+                            "assistant_message_order": assistant_msg['order'],
+                            "total_messages": len(session.messages),
                             "total_duration": chunk_data.get("total_duration", 0),
                             "load_duration": chunk_data.get("load_duration", 0),
                             "prompt_eval_count": chunk_data.get("prompt_eval_count", 0),
                             "eval_count": chunk_data.get("eval_count", 0),
-                            "total_chunks": chunk_count
+                            "total_chunks": chunk_count,
+                            "original": original_request
                         }))
                         break
 
@@ -337,6 +495,7 @@ def stream_ollama_to_websocket(message, model, ws, original_request):
                     continue
 
         print(f"총 {chunk_count}개 청크 처리 완료")
+        print(f"세션 {session.conversation_id}에 총 {len(session.messages)}개 메시지 저장됨")
 
     except requests.exceptions.RequestException as e:
         error_msg = f"Ollama API 호출 오류: {str(e)}"
@@ -344,6 +503,7 @@ def stream_ollama_to_websocket(message, model, ws, original_request):
         ws.send(json.dumps({
             "status": "error",
             "type": "chat_error",
+            "conversation_id": session.conversation_id,
             "error": error_msg,
             "original": original_request,
             "traceback": traceback.format_exc()
@@ -386,7 +546,6 @@ def generate_tts(text, params=None):
     if params is None:
         params = {}
 
-    # 기본값 설정
     payload = {
         "text": text,
         "text_lang": params.get("text_lang", "ko"),
@@ -429,9 +588,9 @@ def change_sd_model(model_name):
 def check_ollama_connection():
     """Ollama 서버 연결 확인"""
     try:
-        # 간단한 테스트 요청
         response = requests.post(OLLAMA_API_URL,
-                                 json={"model": DEFAULT_MODEL, "prompt": "test", "stream": False},
+                                 json={"model": DEFAULT_MODEL, "messages": [{"role": "user", "content": "test"}],
+                                       "stream": False},
                                  timeout=5)
         return response.status_code == 200
     except:
@@ -450,7 +609,6 @@ def check_sd_connection():
 def check_tts_connection():
     """TTS 서버 연결 확인"""
     try:
-        # 간단한 테스트 요청 (빈 텍스트로는 오류가 날 수 있으므로 최소한의 텍스트 사용)
         test_payload = {
             "text": "테스트",
             "text_lang": "ko",
@@ -466,37 +624,17 @@ def check_tts_connection():
 
 
 if __name__ == '__main__':
-    print("=== 통합 AI 서버 시작 ===")
+    print("=== 통합 AI 서버 (대화 기록 관리) 시작 ===")
     print(f"Ollama API URL: {OLLAMA_API_URL}")
     print(f"Stable Diffusion API URL: {SD_API_URL}")
     print(f"TTS API URL: {TTS_API_URL}")
     print("서버 포트: 8000")
+    print("대화 기록: 메모리 기반 저장")
 
     # 연결 테스트
     print("\n=== 연결 테스트 ===")
+    print(f"✅ Ollama API: {'연결 성공' if check_ollama_connection() else '❌ 연결 실패'}")
+    print(f"✅ Stable Diffusion API: {'연결 성공' if check_sd_connection() else '❌ 연결 실패'}")
+    print(f"✅ TTS API: {'연결 성공' if check_tts_connection() else '❌ 연결 실패'}")
 
-    # Ollama 연결 테스트
-    if check_ollama_connection():
-        print("✅ Ollama API 연결 성공!")
-    else:
-        print("⚠️ Ollama API 연결 실패 - 서버가 실행 중인지 확인하세요")
-
-    # Stable Diffusion 연결 테스트
-    if check_sd_connection():
-        try:
-            models = get_sd_models()
-            model_names = [model["title"] for model in models]
-            print(f"✅ Stable Diffusion API 연결 성공! 사용 가능한 모델: {model_names[:3]}{'...' if len(model_names) > 3 else ''}")
-        except Exception as e:
-            print(f"⚠️ Stable Diffusion 모델 목록 조회 실패: {e}")
-    else:
-        print("⚠️ Stable Diffusion API 연결 실패 - AUTOMATIC1111 웹 UI가 --api 옵션으로 실행 중인지 확인하세요")
-
-    # TTS 연결 테스트
-    if check_tts_connection():
-        print("✅ TTS API 연결 성공!")
-    else:
-        print("⚠️ TTS API 연결 실패 - TTS 서버가 localhost:9880에서 실행 중인지 확인하세요")
-
-    print("\n=== 서버 실행 ===")
     app.run(host='0.0.0.0', port=8000, debug=True)
